@@ -1,0 +1,93 @@
+# COMSATS workshop pipeline for GitHub: https://admin.comsats.shakir.blog/guide.php#github
+# Save as .github/workflows/deploy.yml. Put your website files in the public/ folder.
+#
+# Required repository secrets (Settings -> Secrets and variables -> Actions):
+#   SSH_PRIVATE_KEY   your private key, e.g. ~/.ssh/comsats_deploy (never echo it!)
+#   SSH_KNOWN_HOSTS   the server's host key line (see the guide)
+
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:          # adds a "Run workflow" button in the Actions tab
+
+permissions:
+  contents: read
+
+env:
+  SITE_NAME: "ranaalihaider"       # your website name / Linux username
+  DEPLOY_PORT: "2280"
+  SOURCE_DIR: "public/"
+
+jobs:
+  # 1. Fail the pipeline if any PHP file has a syntax error
+  php-lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check PHP syntax
+        run: |
+          php --version
+          find "$SOURCE_DIR" -type f -name "*.php" -print0 | xargs -0 -r -n1 php -l
+
+  # 2. Fail the pipeline if ClamAV finds malware
+  virus-scan:
+    runs-on: ubuntu-24.04
+    needs: php-lint
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ClamAV and update signatures
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clamav
+          sudo systemctl stop clamav-freshclam || true
+          sudo freshclam --stdout
+      - name: Scan files
+        run: clamscan --recursive --infected --max-filesize=50M --max-scansize=200M "$SOURCE_DIR"
+
+  # 3. Upload public/ to the server over SSH
+  deploy:
+    runs-on: ubuntu-24.04
+    needs: virus-scan
+    if: github.ref == 'refs/heads/main'
+    concurrency: deploy-production
+    environment:
+      name: production
+      url: https://${{ env.SITE_NAME }}.comsats.shakir.blog
+    steps:
+      - uses: actions/checkout@v4
+
+      # The key arrives through an environment variable and is written with printf,
+      # so it is never a command argument and can never appear in the log.
+      - name: Set up SSH key
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
+        run: |
+          if [ -z "$SSH_PRIVATE_KEY" ]; then
+            echo "ERROR: secret SSH_PRIVATE_KEY is missing. Add it in Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+          if [ -z "$SSH_KNOWN_HOSTS" ]; then
+            echo "ERROR: secret SSH_KNOWN_HOSTS is missing. Copy it from your status page."
+            exit 1
+          fi
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          umask 077
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > ~/.ssh/id_deploy
+          if ! ssh-keygen -y -f ~/.ssh/id_deploy > /dev/null 2>&1; then
+            echo "ERROR: SSH_PRIVATE_KEY is not a valid private key without passphrase. Copy the whole file including the BEGIN/END lines."
+            exit 1
+          fi
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+
+      - name: Deploy with rsync
+        run: |
+          rsync -rlvz --delete --chmod=D2750,F640 \
+            -e "ssh -p $DEPLOY_PORT -i ~/.ssh/id_deploy -o IdentitiesOnly=yes -o BatchMode=yes" \
+            "$SOURCE_DIR" "$SITE_NAME@$SITE_NAME.comsats.shakir.blog:/var/www/html/$SITE_NAME/"
+
+      - name: Remove SSH key
+        if: always()
+        run: rm -f ~/.ssh/id_deploy
